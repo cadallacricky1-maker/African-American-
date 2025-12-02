@@ -1,0 +1,459 @@
+package com.antitheft.security
+
+import android.content.Context
+import android.os.Build
+import android.provider.Settings
+import android.util.Log
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.firestore.FieldValue
+import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.SetOptions
+import com.google.firebase.messaging.FirebaseMessaging
+import java.util.concurrent.TimeUnit
+
+class FirebaseMultiDeviceManager private constructor(private val context: Context) {
+    
+    private val auth: FirebaseAuth = FirebaseAuth.getInstance()
+    private val firestore: FirebaseFirestore = FirebaseFirestore.getInstance()
+    private val messaging: FirebaseMessaging = FirebaseMessaging.getInstance()
+    
+    companion object {
+        private const val TAG = "FirebaseMultiDevice"
+        
+        @Volatile
+        private var instance: FirebaseMultiDeviceManager? = null
+        
+        fun getInstance(context: Context): FirebaseMultiDeviceManager {
+            return instance ?: synchronized(this) {
+                instance ?: FirebaseMultiDeviceManager(context.applicationContext).also {
+                    instance = it
+                }
+            }
+        }
+    }
+    
+    // Device info data class
+    data class DeviceInfo(
+        val deviceId: String = "",
+        val deviceName: String = "",
+        val deviceType: String = "",
+        val model: String = "",
+        val manufacturer: String = "",
+        val osVersion: String = "",
+        val appVersion: String = "",
+        val lastLogin: Any? = null,
+        val lastSeen: Any? = null,
+        val fcmToken: String = "",
+        val isActive: Boolean = true,
+        val isPrimary: Boolean = false,
+        val location: Map<String, Double>? = null
+    )
+    
+    // Callbacks
+    var onUnknownDeviceDetected: ((DeviceInfo) -> Unit)? = null
+    var onDeviceRemoved: ((String) -> Unit)? = null
+    var onPrimaryDeviceChanged: ((DeviceInfo) -> Unit)? = null
+    
+    init {
+        setupAuthListener()
+        getFCMToken()
+    }
+    
+    private fun setupAuthListener() {
+        auth.addAuthStateListener { firebaseAuth ->
+            val user = firebaseAuth.currentUser
+            if (user != null) {
+                Log.d(TAG, "User authenticated: ${user.uid}")
+                logCurrentDevice(user.uid)
+            } else {
+                Log.d(TAG, "User not authenticated")
+            }
+        }
+    }
+    
+    private fun getFCMToken() {
+        messaging.token.addOnCompleteListener { task ->
+            if (task.isSuccessful) {
+                val token = task.result
+                Log.d(TAG, "FCM Token: $token")
+                updateFCMToken(token)
+            } else {
+                Log.e(TAG, "Failed to get FCM token", task.exception)
+            }
+        }
+    }
+    
+    private fun updateFCMToken(token: String) {
+        val userId = auth.currentUser?.uid ?: return
+        val deviceId = getDeviceId()
+        
+        firestore.collection("users").document(userId)
+            .collection("devices").document(deviceId)
+            .update("fcmToken", token)
+            .addOnSuccessListener {
+                Log.d(TAG, "FCM token updated")
+            }
+    }
+    
+    fun signInAnonymously(callback: (Boolean, String?) -> Unit) {
+        auth.signInAnonymously().addOnCompleteListener { task ->
+            if (task.isSuccessful) {
+                val user = auth.currentUser
+                Log.d(TAG, "Anonymous sign-in successful: ${user?.uid}")
+                callback(true, user?.uid)
+            } else {
+                Log.e(TAG, "Anonymous sign-in failed", task.exception)
+                callback(false, task.exception?.message)
+            }
+        }
+    }
+    
+    fun signInWithEmail(email: String, password: String, callback: (Boolean, String?) -> Unit) {
+        auth.signInWithEmailAndPassword(email, password).addOnCompleteListener { task ->
+            if (task.isSuccessful) {
+                val user = auth.currentUser
+                callback(true, user?.uid)
+            } else {
+                callback(false, task.exception?.message)
+            }
+        }
+    }
+    
+    fun signOut() {
+        val userId = auth.currentUser?.uid
+        val deviceId = getDeviceId()
+        
+        if (userId != null) {
+            // Mark device as inactive
+            firestore.collection("users").document(userId)
+                .collection("devices").document(deviceId)
+                .update("isActive", false, "lastSeen", FieldValue.serverTimestamp())
+        }
+        
+        auth.signOut()
+    }
+    
+    private fun logCurrentDevice(userId: String) {
+        val deviceId = getDeviceId()
+        val deviceInfo = getCurrentDeviceInfo()
+        
+        firestore.collection("users").document(userId)
+            .collection("devices").document(deviceId)
+            .set(deviceInfo.toMap(), SetOptions.merge())
+            .addOnSuccessListener {
+                Log.d(TAG, "Device logged successfully")
+                checkForUnknownDevices(userId, deviceId)
+                updateDeviceHeartbeat(userId, deviceId)
+            }
+            .addOnFailureListener { e ->
+                Log.e(TAG, "Failed to log device", e)
+            }
+    }
+    
+    private fun getCurrentDeviceInfo(): DeviceInfo {
+        val deviceId = getDeviceId()
+        val deviceType = getDeviceType()
+        
+        return DeviceInfo(
+            deviceId = deviceId,
+            deviceName = "${Build.MANUFACTURER} ${Build.MODEL}",
+            deviceType = deviceType,
+            model = Build.MODEL,
+            manufacturer = Build.MANUFACTURER,
+            osVersion = Build.VERSION.RELEASE,
+            appVersion = getAppVersion(),
+            lastLogin = FieldValue.serverTimestamp(),
+            lastSeen = FieldValue.serverTimestamp(),
+            isActive = true
+        )
+    }
+    
+    private fun getDeviceId(): String {
+        return Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID)
+    }
+    
+    private fun getDeviceType(): String {
+        val screenSize = context.resources.configuration.screenLayout and 
+                        android.content.res.Configuration.SCREENLAYOUT_SIZE_MASK
+        
+        return when {
+            screenSize >= android.content.res.Configuration.SCREENLAYOUT_SIZE_XLARGE -> "TABLET_LARGE"
+            screenSize >= android.content.res.Configuration.SCREENLAYOUT_SIZE_LARGE -> "TABLET"
+            else -> "PHONE"
+        }
+    }
+    
+    private fun getAppVersion(): String {
+        return try {
+            val packageInfo = context.packageManager.getPackageInfo(context.packageName, 0)
+            packageInfo.versionName
+        } catch (e: Exception) {
+            "Unknown"
+        }
+    }
+    
+    private fun checkForUnknownDevices(userId: String, currentDeviceId: String) {
+        firestore.collection("users").document(userId)
+            .collection("devices")
+            .whereEqualTo("isActive", true)
+            .get()
+            .addOnSuccessListener { querySnapshot ->
+                val devices = querySnapshot.documents.mapNotNull { doc ->
+                    doc.toObject(DeviceInfo::class.java)
+                }
+                
+                Log.d(TAG, "Active devices: ${devices.size}")
+                
+                // Check if this is a new device
+                val currentDevice = devices.find { it.deviceId == currentDeviceId }
+                if (currentDevice == null) {
+                    // New device detected
+                    val newDevice = getCurrentDeviceInfo()
+                    onUnknownDeviceDetected?.invoke(newDevice)
+                    sendUnknownDeviceAlert(userId, newDevice)
+                }
+                
+                // Check for multiple active devices
+                if (devices.size > 1) {
+                    sendMultipleDevicesAlert(userId, devices)
+                }
+            }
+            .addOnFailureListener { e ->
+                Log.e(TAG, "Failed to check devices", e)
+            }
+    }
+    
+    private fun sendUnknownDeviceAlert(userId: String, newDevice: DeviceInfo) {
+        val alert = hashMapOf(
+            "type" to "UNKNOWN_DEVICE",
+            "deviceId" to newDevice.deviceId,
+            "deviceName" to newDevice.deviceName,
+            "deviceType" to newDevice.deviceType,
+            "timestamp" to FieldValue.serverTimestamp(),
+            "severity" to "HIGH",
+            "read" to false
+        )
+        
+        firestore.collection("users").document(userId)
+            .collection("alerts").add(alert)
+            .addOnSuccessListener {
+                Log.d(TAG, "Unknown device alert sent")
+                sendPushNotificationToOtherDevices(userId, newDevice.deviceId, 
+                    "🚨 New Device Login", 
+                    "Unknown device logged in: ${newDevice.deviceName}")
+            }
+    }
+    
+    private fun sendMultipleDevicesAlert(userId: String, devices: List<DeviceInfo>) {
+        val deviceNames = devices.joinToString(", ") { it.deviceName }
+        
+        val alert = hashMapOf(
+            "type" to "MULTIPLE_DEVICES",
+            "deviceCount" to devices.size,
+            "devices" to deviceNames,
+            "timestamp" to FieldValue.serverTimestamp(),
+            "severity" to "MEDIUM",
+            "read" to false
+        )
+        
+        firestore.collection("users").document(userId)
+            .collection("alerts").add(alert)
+    }
+    
+    private fun sendPushNotificationToOtherDevices(
+        userId: String, 
+        excludeDeviceId: String, 
+        title: String, 
+        message: String
+    ) {
+        firestore.collection("users").document(userId)
+            .collection("devices")
+            .whereEqualTo("isActive", true)
+            .get()
+            .addOnSuccessListener { querySnapshot ->
+                querySnapshot.documents.forEach { doc ->
+                    val device = doc.toObject(DeviceInfo::class.java)
+                    if (device != null && device.deviceId != excludeDeviceId && device.fcmToken.isNotEmpty()) {
+                        // Send FCM notification to this device
+                        // Note: This requires Firebase Cloud Functions or server-side implementation
+                        Log.d(TAG, "Would send notification to: ${device.deviceName}")
+                    }
+                }
+            }
+    }
+    
+    private fun updateDeviceHeartbeat(userId: String, deviceId: String) {
+        // Update last seen every 5 minutes
+        val runnable = object : Runnable {
+            override fun run() {
+                firestore.collection("users").document(userId)
+                    .collection("devices").document(deviceId)
+                    .update("lastSeen", FieldValue.serverTimestamp())
+                    .addOnSuccessListener {
+                        Log.d(TAG, "Heartbeat updated")
+                    }
+                
+                // Schedule next heartbeat
+                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
+                    this, 
+                    TimeUnit.MINUTES.toMillis(5)
+                )
+            }
+        }
+        
+        // Start heartbeat
+        runnable.run()
+    }
+    
+    fun getDevices(callback: (List<DeviceInfo>, String?) -> Unit) {
+        val userId = auth.currentUser?.uid
+        if (userId == null) {
+            callback(emptyList(), "User not authenticated")
+            return
+        }
+        
+        firestore.collection("users").document(userId)
+            .collection("devices")
+            .orderBy("lastSeen", com.google.firebase.firestore.Query.Direction.DESCENDING)
+            .get()
+            .addOnSuccessListener { querySnapshot ->
+                val devices = querySnapshot.documents.mapNotNull { doc ->
+                    doc.toObject(DeviceInfo::class.java)
+                }
+                callback(devices, null)
+            }
+            .addOnFailureListener { e ->
+                callback(emptyList(), e.message)
+            }
+    }
+    
+    fun removeDevice(deviceId: String, callback: (Boolean, String?) -> Unit) {
+        val userId = auth.currentUser?.uid
+        if (userId == null) {
+            callback(false, "User not authenticated")
+            return
+        }
+        
+        firestore.collection("users").document(userId)
+            .collection("devices").document(deviceId)
+            .delete()
+            .addOnSuccessListener {
+                onDeviceRemoved?.invoke(deviceId)
+                callback(true, null)
+            }
+            .addOnFailureListener { e ->
+                callback(false, e.message)
+            }
+    }
+    
+    fun setPrimaryDevice(deviceId: String, callback: (Boolean, String?) -> Unit) {
+        val userId = auth.currentUser?.uid
+        if (userId == null) {
+            callback(false, "User not authenticated")
+            return
+        }
+        
+        // First, unset all primary devices
+        firestore.collection("users").document(userId)
+            .collection("devices")
+            .whereEqualTo("isPrimary", true)
+            .get()
+            .addOnSuccessListener { querySnapshot ->
+                val batch = firestore.batch()
+                querySnapshot.documents.forEach { doc ->
+                    batch.update(doc.reference, "isPrimary", false)
+                }
+                
+                // Set new primary device
+                val deviceRef = firestore.collection("users").document(userId)
+                    .collection("devices").document(deviceId)
+                batch.update(deviceRef, "isPrimary", true)
+                
+                batch.commit()
+                    .addOnSuccessListener {
+                        callback(true, null)
+                    }
+                    .addOnFailureListener { e ->
+                        callback(false, e.message)
+                    }
+            }
+    }
+    
+    fun getAlerts(callback: (List<Map<String, Any>>, String?) -> Unit) {
+        val userId = auth.currentUser?.uid
+        if (userId == null) {
+            callback(emptyList(), "User not authenticated")
+            return
+        }
+        
+        firestore.collection("users").document(userId)
+            .collection("alerts")
+            .orderBy("timestamp", com.google.firebase.firestore.Query.Direction.DESCENDING)
+            .limit(50)
+            .get()
+            .addOnSuccessListener { querySnapshot ->
+                val alerts = querySnapshot.documents.mapNotNull { it.data }
+                callback(alerts, null)
+            }
+            .addOnFailureListener { e ->
+                callback(emptyList(), e.message)
+            }
+    }
+    
+    fun markAlertAsRead(alertId: String) {
+        val userId = auth.currentUser?.uid ?: return
+        
+        firestore.collection("users").document(userId)
+            .collection("alerts").document(alertId)
+            .update("read", true)
+    }
+    
+    fun triggerRemoteWipeOnDevice(deviceId: String, callback: (Boolean, String?) -> Unit) {
+        val userId = auth.currentUser?.uid
+        if (userId == null) {
+            callback(false, "User not authenticated")
+            return
+        }
+        
+        val wipeCommand = hashMapOf(
+            "command" to "REMOTE_WIPE",
+            "deviceId" to deviceId,
+            "timestamp" to FieldValue.serverTimestamp(),
+            "executed" to false
+        )
+        
+        firestore.collection("users").document(userId)
+            .collection("commands").add(wipeCommand)
+            .addOnSuccessListener {
+                callback(true, null)
+                sendPushToDevice(deviceId, "REMOTE_WIPE")
+            }
+            .addOnFailureListener { e ->
+                callback(false, e.message)
+            }
+    }
+    
+    private fun sendPushToDevice(deviceId: String, command: String) {
+        // This would typically be handled by Firebase Cloud Functions
+        // For now, we just log it
+        Log.d(TAG, "Push notification sent to device $deviceId: $command")
+    }
+    
+    private fun DeviceInfo.toMap(): Map<String, Any?> {
+        return mapOf(
+            "deviceId" to deviceId,
+            "deviceName" to deviceName,
+            "deviceType" to deviceType,
+            "model" to model,
+            "manufacturer" to manufacturer,
+            "osVersion" to osVersion,
+            "appVersion" to appVersion,
+            "lastLogin" to lastLogin,
+            "lastSeen" to lastSeen,
+            "fcmToken" to fcmToken,
+            "isActive" to isActive,
+            "isPrimary" to isPrimary,
+            "location" to location
+        )
+    }
+}
